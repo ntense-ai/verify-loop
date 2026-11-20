@@ -17,14 +17,9 @@ Do **not** stack multiple overlapping reviewers on top of each other. Adding a s
    - Pass the **prior round's findings**, **the fixes applied**, and **the incremental diff since the prior round** (or message the same reviewer subagent via `send_message` so its conversation state persists).
    - Verify whether earlier `Important` items are genuinely resolved and inspect only the newly touched lines and their ripple effects.
 
-### Using a Separate Grader Subagent in Antigravity
-For complex features, structured file generation, or multi-file refactors:
-1. Invoke a dedicated read-only subagent (`invoke_subagent` with `TypeName: "research"` or `TypeName: "self"`, `Role: "Rubric Grader"`).
-2. Supply in its prompt:
-   - Base ref and target commit/diff (`git diff <base>`)
-   - Exact rubric loaded from the **base branch** (`git show <base>:REVIEW.md`, `git show <base>:FEATURE_MAP.md`)
-   - Runtime verification evidence already collected (test outputs, screenshots, E2E results)
-3. When fixes are needed, keep messaging the **same** subagent `conversationId` via `send_message` for Round 2 and Round 3 so rounds build on each other cleanly.
+### Running a separate grader
+
+When an independent review is appropriate and the host supports authorised delegation, give a read-only reviewer the base ref, frozen candidate, base-branch rubric, and runtime evidence. For later rounds, supply the earlier findings and incremental diff. If independent review is required and no reviewer is available, leave it pending for a human. A self-review can still identify issues while that decision is pending.
 
 ---
 

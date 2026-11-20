@@ -16,6 +16,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import subprocess
 import sys
 from typing import Any
 
@@ -29,16 +31,12 @@ from verify_guard import (  # noqa: E402
     compute_tree_fingerprint,
     find_repo_root,
     load_session,
-    read_from_base_or_disk,
+    run_git,
     resolve_base_ref,
     save_session,
     state_dir,
 )
 
-GIT_COMMIT_RE = re.compile(
-    r"(?:^|&&|\|\||[;&|\n])\s*git\s+(?:(?:-[Cc]\s+\S+|--[A-Za-z0-9-]+(?:=\S+)?|-[A-Za-z]+)\s+)*commit\b"
-)
-DRY_OR_HELP_RE = re.compile(r"\s(--dry-run|--help|-h)\b")
 EXPLICIT_BYPASS_RE = re.compile(
     r"(Verified-By:\s*none\s*\([^)\n]{3,}\)|Unverified-Reason:\s*\S+)",
     re.IGNORECASE,
@@ -48,56 +46,82 @@ MAX_ENFORCE_BLOCKS_PER_SESSION = 2
 
 
 def resolve_gate_mode(repo: Path) -> str:
+    local = run_git(repo, ["config", "--local", "--get", "verifyloop.gateMode"])
+    if local.returncode == 0:
+        mode = local.stdout.strip().lower()
+        if mode not in VALID_MODES:
+            raise ValueError("Invalid local verifyloop.gateMode")
+        return mode
     base_ref = resolve_base_ref(repo)
-    cfg_doc = read_from_base_or_disk(repo, base_ref, ".verify-loop.json")
-    if cfg_doc["exists"]:
-        try:
-            parsed = json.loads(cfg_doc["content"])
-            mode = str(parsed.get("gateMode", "")).strip().lower()
-            if mode in VALID_MODES:
-                return mode
-        except json.JSONDecodeError:
-            pass
-    env_mode = os.environ.get("VERIFY_GATE_MODE", "").strip().lower()
-    if env_mode in VALID_MODES:
-        return env_mode
+    if base_ref and base_ref != "HEAD":
+        config = run_git(repo, ["show", f"{base_ref}:.verify-loop.json"])
+        if config.returncode == 0:
+            mode = json.loads(config.stdout).get("gateMode")
+            if mode not in VALID_MODES:
+                raise ValueError("Invalid gateMode in base configuration")
+            return mode
     return "observe"
 
 
-def extract_commit_message_text(repo: Path, command_line: str) -> str:
-    parts: list[str] = [command_line]
-    for file_match in re.finditer(r"(?:-F|--file(?:=|\s+))(['\"]?)([^\s'\"]+)\1", command_line):
-        candidate = Path(file_match.group(2))
-        if not candidate.is_absolute():
-            candidate = repo / candidate
-        if candidate.is_file():
-            try:
-                parts.append(candidate.read_text(encoding="utf-8"))
-            except OSError:
-                pass
-    return "\n".join(parts)
+def session_detail(repo: Path, sid: str) -> tuple[bool, str]:
+    session = load_session(repo, sid)
+    if session.get("verified") and session.get("tree_fingerprint") == compute_tree_fingerprint(repo):
+        return True, session["commit_trailer"]
+    return False, "No current pass for this staged snapshot"
 
 
-def check_session_verification(repo: Path, conversation_id: str) -> tuple[bool, str]:
-    current_fp = compute_tree_fingerprint(repo)
-    candidate_ids = [conversation_id] if conversation_id == "default" else [conversation_id, "default"]
+def git_message_gate(repo: Path, message_file: Path) -> int:
+    mode = resolve_gate_mode(repo)
+    if mode == "off":
+        return 0
+    trailers = run_git(repo, ["interpret-trailers", "--parse", str(message_file.resolve())], check=True)
+    lines = trailers.stdout.splitlines()
+    verified = [line for line in lines if line.lower().startswith("verified-by:")]
+    exempt = len(verified) == 1 and EXPLICIT_BYPASS_RE.fullmatch(verified[0])
+    sid = os.environ.get("VERIFY_SESSION_ID") or "default"
+    ok, expected = session_detail(repo, sid)
+    if exempt or (ok and verified == [expected]):
+        append_gate_log(repo, {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                               "mode": mode, "conversationId": sid,
+                               "outcome": "allow_explicit_explanation" if exempt else "allow_verified"})
+        return 0
+    append_gate_log(repo, {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
+                           "mode": mode, "outcome": "observe_would_block" if mode == "observe" else "enforce_blocked",
+                           "conversationId": sid, "reason": "missing current verification or matching trailer"})
+    print("verify-loop: commit needs a current verification and its matching trailer, or a documented Verified-By: none reason.", file=sys.stderr)
+    return int(mode == "enforce")
 
-    stale_reason: str | None = None
-    for sid in candidate_ids:
-        session = load_session(repo, sid)
-        if not session.get("verified"):
-            continue
-        recorded_fp = session.get("tree_fingerprint")
-        if recorded_fp == current_fp:
-            return True, f"verified in session '{sid}' ({session.get('commit_trailer', 'Verified-By recorded')})"
-        stale_reason = (
-            f"session '{sid}' had a passing verification stamp, but files changed afterward "
-            "(working tree fingerprint mismatch)"
-        )
 
-    if stale_reason:
-        return False, stale_reason
-    return False, "session has no recorded verification pass (`verify_guard.py record --status pass`)"
+def parse_git_commit(command: str, cwd: Path):
+    # The Git commit-msg hook handles compound commands and commits from other clients.
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens or tokens[0] != "git" or any(t in {";", "&&", "|", "||", "&"} for t in tokens):
+        return None
+    location = []
+    i = 1
+    while i < len(tokens) and tokens[i] != "commit":
+        opt = tokens[i]
+        if opt in ("-C", "-c", "--git-dir", "--work-tree") and i + 1 < len(tokens):
+            if opt != "-c":
+                location.extend(tokens[i:i + 2])
+            i += 2
+        elif opt.startswith(("-C", "--git-dir=", "--work-tree=")):
+            location.append(opt)
+            i += 1
+        else:
+            return None
+    if i == len(tokens):
+        return None
+    args = tokens[i + 1:]
+    result = run_git(cwd, [*location, "rev-parse", "--show-toplevel"])
+    if result.returncode:
+        raise ValueError("Unable to resolve commit repository")
+    return Path(result.stdout.strip()), args
 
 
 def append_gate_log(repo: Path, event: dict[str, Any]) -> None:
@@ -112,14 +136,16 @@ def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     args = tool_call.get("args") or {}
     command_line = str(args.get("CommandLine", ""))
 
-    if tool_name != "run_command" or not GIT_COMMIT_RE.search(command_line):
+    if tool_name != "run_command":
         return {"decision": "allow"}
-    if DRY_OR_HELP_RE.search(command_line):
-        return {"decision": "allow"}
-
     workspace_paths = payload.get("workspacePaths") or []
-    raw_cwd = payload.get("cwd") or (workspace_paths[0] if workspace_paths else ".")
-    repo = find_repo_root(Path(raw_cwd))
+    cwd = args.get("Cwd") or payload.get("cwd") or (workspace_paths[0] if workspace_paths else ".")
+    target = parse_git_commit(command_line, Path(cwd))
+    if target is None:
+        return {"decision": "allow"}
+    repo, commit_args = target
+    if any(flag in commit_args for flag in ("--help", "--dry-run", "-h")):
+        return {"decision": "allow"}
     mode = resolve_gate_mode(repo)
     if mode == "off":
         return {"decision": "allow"}
@@ -127,21 +153,14 @@ def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     conversation_id = str(payload.get("conversationId") or "default")
     now = dt.datetime.now(dt.timezone.utc).isoformat()
 
-    msg_probe = extract_commit_message_text(repo, command_line)
-    if EXPLICIT_BYPASS_RE.search(msg_probe):
-        append_gate_log(
-            repo,
-            {
-                "timestamp": now,
-                "mode": mode,
-                "conversationId": conversation_id,
-                "outcome": "allow_explicit_explanation",
-                "command": command_line,
-            },
-        )
+    # The final message (including -F and editor input) is validated by Git.
+    if any(EXPLICIT_BYPASS_RE.fullmatch(line) for arg in commit_args for line in arg.splitlines()):
         return {"decision": "allow"}
 
-    ok, detail = check_session_verification(repo, conversation_id)
+    sid = os.environ.get("VERIFY_SESSION_ID") or conversation_id
+    if not load_session(repo, sid).get("round_history") and "VERIFY_SESSION_ID" not in os.environ:
+        sid = "default"
+    ok, detail = session_detail(repo, sid)
     if ok:
         append_gate_log(
             repo,
@@ -257,10 +276,13 @@ def inspect_log(repo_arg: str, as_json: bool) -> int:
 def main() -> int:
     if len(sys.argv) > 1:
         parser = argparse.ArgumentParser(description=__doc__)
+        parser.add_argument("--git-message", type=Path, help="Validate a Git commit-msg hook message file")
         parser.add_argument("--inspect-log", action="store_true", help="Summarize gate observe/enforce log")
         parser.add_argument("--repo", default=".", help="Path inside git repository")
         parser.add_argument("--json", action="store_true", help="Emit JSON output for --inspect-log")
         args = parser.parse_args()
+        if args.git_message:
+            return git_message_gate(find_repo_root(Path(args.repo)), args.git_message)
         if args.inspect_log:
             return inspect_log(args.repo, args.json)
         parser.print_help()
@@ -282,4 +304,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        if len(sys.argv) == 1:
+            print(json.dumps({"decision": "deny", "reason": str(exc)}))
+        else:
+            sys.exit(f"verify-loop: {exc}")

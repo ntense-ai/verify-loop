@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
+import shlex
 import json
 from pathlib import Path
 import re
@@ -38,29 +40,33 @@ def load_inputs(args: argparse.Namespace) -> list[dict[str, str]]:
     if args.inputs_dir:
         d = Path(args.inputs_dir)
         for fp in sorted(x for x in d.iterdir() if x.is_file()):
-            cases.append({"id": fp.name, "payload": fp.read_text(encoding="utf-8"), "file": str(fp)})
+            cases.append({"id": fp.name, "payload": fp.read_bytes().decode("utf-8"), "file": str(fp)})
     if args.generator_cmd:
         for idx in range(1, args.generate_count + 1):
-            proc = subprocess.run(args.generator_cmd, shell=True, capture_output=True, text=True, check=True)
+            proc = subprocess.run(args.generator_cmd, shell=True, capture_output=True, text=True, check=True, timeout=args.timeout)
             cases.append({"id": f"generated-{idx}", "payload": proc.stdout, "file": ""})
     return cases
 
 
 def run_target(cmd_template: str, case: dict[str, str], timeout: float) -> dict[str, Any]:
-    uses_placeholder = "{input}" in cmd_template or "{file}" in cmd_template
-    rendered = cmd_template.replace("{input}", case["payload"]).replace("{file}", case["file"])
+    # Split the trusted template before inserting any corpus data.
+    parts = shlex.split(cmd_template)
+    if not parts:
+        raise ValueError("Empty target command")
+    marker = re.compile(r"{(input|file)}")
+    values = {"input": case["payload"], "file": case["file"]}
+    uses_placeholder = any(marker.search(part) for part in parts)
+    argv = [marker.sub(lambda match: values[match[1]], part) for part in parts]
     proc = subprocess.run(
-        rendered,
-        shell=True,
-        input=None if uses_placeholder else case["payload"],
+        argv,
+        input=b"" if uses_placeholder else case["payload"].encode("utf-8"),
         capture_output=True,
-        text=True,
         timeout=timeout,
     )
     return {
         "returncode": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
+        "stdout": proc.stdout.decode("utf-8"),
+        "stderr": proc.stderr.decode("utf-8"),
     }
 
 
@@ -73,7 +79,7 @@ def normalize_text(
     strip_uuids: bool,
     regex_rules: list[tuple[re.Pattern[str], str]],
 ) -> str:
-    out = text.replace("\r\n", "\n")
+    out = text
     if sort_json:
         try:
             parsed = json.loads(out)
@@ -88,33 +94,23 @@ def normalize_text(
         out = pattern.sub(repl, out)
     if ignore_whitespace:
         out = "\n".join(" ".join(ln.split()) for ln in out.splitlines() if ln.strip())
-    return out.strip()
+    return out
 
 
 def load_approved_diffs(path_str: str | None) -> list[dict[str, str]]:
     if not path_str:
         return []
     raw = json.loads(Path(path_str).read_text(encoding="utf-8"))
-    return raw if isinstance(raw, list) else raw.get("approved_diffs", [])
-
-
-def match_approved_diff(
-    case: dict[str, str],
-    unified_diff: str,
-    rules: list[dict[str, str]],
-) -> str | None:
+    rules = raw.get("approved_diffs") if isinstance(raw, dict) else raw
+    if not isinstance(rules, list):
+        raise ValueError("Expected a list of approved differences")
     for rule in rules:
-        input_re = rule.get("input_regex")
-        diff_re = rule.get("diff_regex")
-        case_id = rule.get("case_id")
-        if case_id and case_id != case["id"]:
-            continue
-        if input_re and not re.search(input_re, case["payload"]):
-            continue
-        if diff_re and not re.search(diff_re, unified_diff, re.MULTILINE):
-            continue
-        return rule.get("reason", "approved intentional difference")
-    return None
+        if (not isinstance(rule, dict)
+                or set(rule) != {"case_id", "difference_sha256", "reason"}
+                or not all(isinstance(v, str) and v.strip() for v in rule.values())
+                or not re.fullmatch(r"[a-f0-9]{64}", rule["difference_sha256"])):
+            raise ValueError("Each approval requires case_id, difference_sha256 and reason. Review the JSON report for the digest.")
+    return rules
 
 
 def main() -> int:
@@ -201,9 +197,14 @@ def main() -> int:
                 tofile=f"new ({case['id']})",
             )
         )
-        approved_reason = match_approved_diff(case, udiff, approved_rules)
+        comparison = [[old_res["returncode"], old_norm_out, old_norm_err],
+                      [new_res["returncode"], new_norm_out, new_norm_err]]
+        digest = hashlib.sha256(json.dumps(comparison).encode("ascii")).hexdigest()
+        approved_reason = next((rule["reason"] for rule in approved_rules
+                                if rule["case_id"] == case["id"] and rule["difference_sha256"] == digest), None)
         record = {
             "case_id": case["id"],
+            "difference_sha256": digest,
             "old_exit": old_res["returncode"],
             "new_exit": new_res["returncode"],
             "diff": udiff,
@@ -238,4 +239,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, re.error, subprocess.SubprocessError) as exc:
+        sys.exit(f"Differential runner error: {exc}")

@@ -3,7 +3,7 @@ name: verify-loop
 description: >-
   Run evidence-backed verification loops, end-to-end smoke tests, diff-triggered
   reliability checks, stateful rubric reviews, and pre-commit verification gates.
-  Use this skill before committing or finishing code changes (/verify), when
+  Use this skill before committing or finishing code changes, when
   writing or upgrading E2E, property-based, or differential tests, when
   troubleshooting flaky tests, or when bootstrapping and evolving a repository's
   verification harness, REVIEW.md rules, and commit gates.
@@ -12,6 +12,16 @@ description: >-
 # Verification Loop (`verify-loop`)
 
 Equip agent runs to verify changes **with concrete runtime evidence** so humans review evidence and definitions of "done" instead of auditing every line of every diff by hand.
+
+## Using the skill in your agent
+
+Ask “Use the verify-loop skill on these changes.” The workflow needs Git, Python 3.9 or later, and a terminal in the target repository. Use the interpreter available on your system (for example, `python3` or `py -3`). Use the host's available browser, simulator, or CLI harness for runtime evidence.
+
+The examples assume a project installation in `.agents/skills/verify-loop`. For a personal installation or another discovery directory, resolve `scripts/`, `resources/`, and `references/` beside the loaded `SKILL.md`. Run the helpers by their resolved paths with the target repository as the working directory. An explicit `--repo` also selects the target for the guard.
+
+Codex, Cursor, Copilot CLI, Gemini CLI, and Antigravity support the project directory above. Claude Code discovers the project skill through `.claude/skills/verify-loop`. This repository supplies a relative directory link there. For checkouts without symlink support, install the full skill directory at the Claude path. In Claude Code, invoke `/verify-loop`.
+
+The optional Git commit-msg hook runs across Git clients. Antigravity also supports an earlier tool-call check. Use a separate reviewer only when available and authorised. Otherwise review the evidence in a fresh pass and record that it was a self-review.
 
 ## Core Operating Invariants
 
@@ -30,14 +40,14 @@ Select the workflow matching your current task:
 
 | Goal | Mode | Reference / Tooling |
 | :--- | :--- | :--- |
-| Verify pending changes before finishing, committing, or opening a PR (`/verify`) | **Mode 1: Pre-Commit Verification Loop** | Steps below + [`scripts/verify_guard.py`](./scripts/verify_guard.py) |
+| Verify pending changes before finishing, committing, or opening a PR | **Mode 1: Pre-Commit Verification Loop** | Steps below + [`scripts/verify_guard.py`](./scripts/verify_guard.py) |
 | Design or add E2E, property-based, or differential tests, or eliminate flaky tests | **Mode 2: High-Leverage Test Engineering** | [`references/test-strategy.md`](./references/test-strategy.md) + [`scripts/diff_oracle.py`](./scripts/diff_oracle.py) |
 | Run a separate rubric grader or multi-round stateful code review | **Mode 3: Stateful Review & Rubric Grading** | [`references/review-and-grading.md`](./references/review-and-grading.md) |
 | Bootstrap repo verification files, roll out commit gates (`observe` -> `enforce`), turn missed bugs into rules, evaluate check recall, or prune rules | **Mode 4: Bootstrap, Gate & Close the Loop** | [`references/closing-the-loop.md`](./references/closing-the-loop.md) + [`resources/`](./resources/) |
 
 ---
 
-## Mode 1: Pre-Commit Verification Loop (Default `/verify` Runbook)
+## Mode 1: Pre-Commit Verification Loop (Default Runbook)
 
 Execute these steps in order before committing or declaring an implementation task done.
 
@@ -53,6 +63,14 @@ python3 .agents/skills/verify-loop/scripts/verify_guard.py triage
 - **Keep `matched_checks` in scope**: Evaluate **only** the reliability checklist items whose path or diff triggers matched (typically 3–10 items), rather than scanning unrelated historical rules.
 
 ### Step 2: Tier 1 — Cheap Local Checks First
+
+For commit verification, stage the intended files. From a worktree matching that staged snapshot, run:
+
+```bash
+python3 .agents/skills/verify-loop/scripts/verify_guard.py begin --new-task
+```
+
+Keep evidence outside the worktree or in ignored output directories. A separate worktree lets you verify a candidate alongside unfinished edits. Set a distinct `VERIFY_SESSION_ID` for each concurrent task. An inspection without a commit can use triage and runtime checks directly.
 
 Run the project's fast deterministic checks before booting heavy environments:
 
@@ -81,16 +99,10 @@ Static checks and isolated unit tests can pass while the user-facing feature is 
 
 When any check in Steps 2–4 fails:
 
-1. Log the failure round via `verify_guard.py`:
-   ```bash
-   python3 .agents/skills/verify-loop/scripts/verify_guard.py record \
-     --status fail \
-     --checks "<failing-check>" \
-     --summary "Round N failure: <root cause & symptom>"
-   ```
-2. **Diagnose root cause** using prior round context (do not repeat failed hypotheses; never add sleeps, skips, or blind retries).
-3. Apply the fix and re-run the failed check plus Tier 1 fast checks.
-4. **Hard Stop at Round 3**: When `verify_guard.py record` reports `must_escalate: true` (3 failed rounds), **stop editing code immediately** and escalate to the user with:
+1. Record the initial failure with `record --status fail --checks <name> --summary "<symptom>"`.
+2. Diagnose and apply the fix, stage it, then run `begin` again in the same session. Use `--new-task` only for an independent task.
+3. Rerun the check. On failure use `record --status fail --after-fix --checks <name> --summary "<attempt and result>"`. On success use `record --status resolved --checks <name>`. Exercise all checks claimed in the final trailer against the final candidate.
+4. When the same check fails after three completed fixes, stop and escalate with:
    - Exact failing check and error/screenshot evidence
    - What Rounds 1, 2, and 3 each attempted and why each fell short
    - The specific code-owner decision or domain context needed to unblock
@@ -119,7 +131,7 @@ python3 .agents/skills/verify-loop/scripts/verify_guard.py record \
 ```
 
 > [!IMPORTANT]
-> `verify_guard.py record` fingerprints the current working tree. If you edit any file after recording `pass`, the fingerprint becomes stale and you **must** re-verify before committing.
+> `verify_guard.py record` checks the staged snapshot captured by `begin`. Stage further changes and verify the new candidate before committing.
 
 When creating the commit, include the `Verified-By:` trailer (or stamp a commit message file via `verify_guard.py stamp-message`):
 

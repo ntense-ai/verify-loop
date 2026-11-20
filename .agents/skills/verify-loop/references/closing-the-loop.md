@@ -14,33 +14,15 @@ Copy and tailor the starter templates from [`../resources/`](../resources/) as c
    - Diff-triggered checks (`Trigger Paths`, `Trigger Diff Regex`, `Check`, `Provenance`) evaluated automatically by `verify_guard.py triage`.
 3. **`FEATURE_MAP.md`** (from [`../resources/FEATURE_MAP.template.md`](../resources/FEATURE_MAP.template.md))
    - User-visible flows, selectors/shortcuts/commands, and expected outcomes for E2E smoke testing and rubric grading.
-4. **Commit Gate Hook (`.agents/hooks.json` + `.verify-loop.json`)**
-   - Copy [`../resources/verify-loop.config.json`](../resources/verify-loop.config.json) to `<repo>/.verify-loop.json` (starts in `"gateMode": "observe"`).
-   - Merge [`../resources/hooks.template.json`](../resources/hooks.template.json) into `<repo>/.agents/hooks.json`.
-   - Commit these files to the default branch so `verify_guard.py` and `commit_gate_hook.py` load them from an immutable base ref.
+4. **Optional Git commit gate**
+   - Install the commit-msg template in the repository's active Git hooks. Set the repository-local Git setting `verifyloop.runtime` to the absolute path of a separately installed copy of the reviewed scripts. Integrate the check into any existing commit-msg hook.
+   - Antigravity also supports the PreToolUse template. Set its command to the absolute trusted script path in the host's user-controlled hook settings.
 
----
+## 2. Progressive commit gate rollout
 
-## 2. Progressive Commit Gate Rollout (`off` -> `observe` -> `enforce`)
+Start with `git config --local verifyloop.gateMode observe`. Inspect events with `commit_gate_hook.py --inspect-log` and compare them with `verify_guard.py audit-commits`. To enable enforcement, set the local mode to `enforce`. A named base branch's committed configuration supplies the default when the local setting is absent. A bootstrap checkout defaults to observation.
 
-Never turn on a blocking commit gate cold without measuring false positives first.
-
-1. **Stage 1 — `observe` mode (Default)**:
-   - Set `"gateMode": "observe"` in `.verify-loop.json`.
-   - `commit_gate_hook.py` never blocks commits, but logs every commit that *would* have been blocked to the per-repository state log (`/tmp/verify-loop-state/<repo>-<hash>/gate-observe.log`, or `$VERIFY_LOOP_STATE_DIR/gate-observe.log`).
-   - Inspect observed events periodically:
-     ```bash
-     python3 .agents/skills/verify-loop/scripts/commit_gate_hook.py --inspect-log
-     python3 .agents/skills/verify-loop/scripts/verify_guard.py audit-commits -n 50
-     ```
-   - Tune workflows or bypass conventions until false positives drop near zero.
-2. **Stage 2 — `enforce` mode**:
-   - Update `"gateMode": "enforce"` on the base branch.
-   - Unverified commits in a session without `verify_guard.py record --status pass` are blocked **unless**:
-     - The commit message carries an explicit explanation (`Verified-By: none (<concrete reason>)`), **or**
-     - Commits have already been blocked **twice** in the current session (`blocked_commits_count >= 2`), triggering the **circuit breaker** on the 3rd attempt so an imperfect agent session never deadlocks permanently.
-
----
+Git validates the final staged tree and the message's verification trailer. A documented `Verified-By: none (reason)` trailer records an explicit exception. The Antigravity preflight retains its two-block session circuit breaker. The Git hook evaluates the actual commit independently.
 
 ## 3. Turning Missed Bugs into Rules (Two Formal Workflows)
 
@@ -51,18 +33,18 @@ A candidate rule qualifies **only** if:
 1. The same issue pattern occurred in **at least 2 PRs or reverts**, AND
 2. Its trigger is **observable directly from a `git diff`** (path glob or diff syntax/token pattern).
 
-**3-Agent Disproof Trial** (use `run_workflow` `parallel(...)` or 3 parallel `research` subagents):
+**Independent review of candidate rules** (use three reviewers when available and authorised):
 1. Draft the candidate rule (`Trigger` + `Check` + `Provenance`).
-2. Spawn **3 independent agents** instructed to **disprove or break** the candidate rule against clean historical commits in the repo:
+2. Ask independent reviewers to **disprove or break** the candidate rule against clean historical commits in the repo:
    - Agent 1 searches for clean, valid diffs where the rule triggers false positives.
    - Agent 2 tests whether the rule wording is ambiguous or unactionable.
    - Agent 3 checks redundancy/conflict against existing `REVIEW.md` and `RELIABILITY_CHECKLIST.md` rules.
-3. Refine or discard if disproved; otherwise open a dedicated PR for human code-owner approval.
+3. If only one reviewer is available, examine all three questions and label the result as a single review. Refine or discard if disproved; otherwise open a dedicated PR for human code-owner approval.
 
 ### Method B: Incident Replay (3 Bug-Finder Agents)
 When analyzing a past production incident tied to a specific PR:
 1. Check out / reconstruct the repository at the exact pre-incident PR commit and diff.
-2. Spawn **3 independent bug-finder subagents** against that diff (without telling them the answer).
+2. When three independent reviewers are available, give each the same diff without the answer. Otherwise record the available results and leave the independent threshold unevaluated.
 3. Evaluate detectability:
    - If **at least 2 of 3** identify the bug, the class of bug is reliably detectable by an agent.
    - If the regular verification/review pass missed it—especially on a small diff—add a targeted entry to `REVIEW.md` or `RELIABILITY_CHECKLIST.md` citing the incident/PR in `Provenance`.

@@ -72,7 +72,7 @@ Use **differential testing** for large-scale migrations, parser/compiler rewrite
 3. **Normalize nondeterministic noise**:
    - Strip or canonicalize volatile fields: timestamps, random UUIDs, ephemeral ports, unordered JSON keys (`--sort-json`), irrelevant whitespace (`--ignore-whitespace`).
 4. **Track intentional changes explicitly**:
-   - Maintain a version-controlled `approved-diffs.json` allowlist documenting every intentional behavioral difference (`input_regex`, `diff_regex`, `reason`). Any unapproved divergence fails the check.
+   - Maintain a version-controlled `approved-diffs.json` allowlist documenting every intentional behavioral difference (`case_id`, `difference_sha256`, `reason` from the reviewed JSON report). Any unapproved divergence fails the check.
 
 ---
 

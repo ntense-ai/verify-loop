@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ./skills/verify-loop/scripts/commit_gate_hook.py",
+            "command": "python3 -I \"/absolute/path/to/trusted/verify-loop/scripts/commit_gate_hook.py\"",
             "timeout": 10
           }
         ]

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Set verifyloop.runtime to the absolute path of a reviewed scripts directory.
+runtime=$(git config --local --get verifyloop.runtime) || exit 1
+exec python3 -I "$runtime/commit_gate_hook.py" --git-message "$1"

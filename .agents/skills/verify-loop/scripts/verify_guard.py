@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 sys.dont_write_bytecode = True
@@ -160,7 +161,7 @@ def read_from_base_or_disk(repo: Path, base_ref: str | None, rel_path: str) -> d
         return {
             "exists": True,
             "source": "working_tree_bootstrap",
-            "trusted": base_ref is None,
+            "trusted": False,
             "warning": (
                 f"{posix} does not exist on base ref '{base_ref}' yet; loaded from working tree "
                 "for initial bootstrap. Commit it to the base branch before treating it as an immutable gate."
@@ -177,37 +178,28 @@ def collect_diff_state(repo: Path, base_ref: str | None) -> tuple[list[str], dic
     per_file_diff: dict[str, str] = {}
     full_diff_parts: list[str] = []
 
-    if base_ref:
-        names_proc = run_git(repo, ["diff", "--name-only", base_ref])
-        if names_proc.returncode == 0:
-            for line in names_proc.stdout.splitlines():
-                if line.strip():
-                    changed_files.add(line.strip())
-        diff_proc = run_git(repo, ["diff", "--unified=3", base_ref])
-        if diff_proc.returncode == 0 and diff_proc.stdout:
-            full_diff_parts.append(diff_proc.stdout)
-            current_file: str | None = None
-            buf: list[str] = []
-            for line in diff_proc.stdout.splitlines(keepends=True):
-                if line.startswith("diff --git "):
-                    if current_file and buf:
-                        per_file_diff[current_file] = "".join(buf)
-                    buf = [line]
-                    m = re.match(r"^diff --git a/(.+?) b/(.+?)\s*$", line)
-                    current_file = m.group(2) if m else None
-                else:
-                    buf.append(line)
-            if current_file and buf:
-                per_file_diff[current_file] = "".join(buf)
-    else:
-        staged_proc = run_git(repo, ["diff", "--cached", "--name-only"])
-        if staged_proc.returncode == 0:
-            for line in staged_proc.stdout.splitlines():
-                if line.strip():
-                    changed_files.add(line.strip())
-        staged_diff = run_git(repo, ["diff", "--cached", "--unified=3"])
-        if staged_diff.returncode == 0 and staged_diff.stdout:
-            full_diff_parts.append(staged_diff.stdout)
+    comparison = [base_ref] if base_ref else ["--cached"]
+    names_proc = run_git(repo, ["diff", "--name-only", *comparison])
+    if names_proc.returncode == 0:
+        for line in names_proc.stdout.splitlines():
+            if line.strip():
+                changed_files.add(line.strip())
+    diff_proc = run_git(repo, ["diff", "--unified=3", *comparison])
+    if diff_proc.returncode == 0 and diff_proc.stdout:
+        full_diff_parts.append(diff_proc.stdout)
+        current_file: str | None = None
+        buf: list[str] = []
+        for line in diff_proc.stdout.splitlines(keepends=True):
+            if line.startswith("diff --git "):
+                if current_file and buf:
+                    per_file_diff[current_file] = "".join(buf)
+                buf = [line]
+                m = re.match(r"^diff --git a/(.+?) b/(.+?)\s*$", line)
+                current_file = m.group(2) if m else None
+            else:
+                buf.append(line)
+        if current_file and buf:
+            per_file_diff[current_file] = "".join(buf)
 
     untracked_proc = run_git(repo, ["ls-files", "--others", "--exclude-standard"])
     if untracked_proc.returncode == 0:
@@ -253,6 +245,14 @@ def audit_check_integrity(changed_files: list[str], per_file_diff: dict[str, str
                 for ln in patch.splitlines()
                 if ln.startswith("+") and not ln.startswith("+++")
             ]
+            added = {line.strip() for line in added_lines}
+            assertion = re.compile(r"\b(?:assert\w*|expect|require|test|it|describe|test_\w+)\b|#\[test\]", re.I)
+            for line in patch.splitlines():
+                removed = line[1:].strip()
+                if (line.startswith("-") and not line.startswith("---")
+                        and removed not in added and assertion.search(removed)):
+                    issues.append({"type": "test_check_removed", "severity": "high", "file": rel,
+                                   "line": removed, "message": "Review removed assertion or test case."})
             for ln in added_lines:
                 if SKIP_MARKERS_RE.search(ln):
                     issues.append(
@@ -367,48 +367,39 @@ def match_reliability_items(
 
 
 def compute_tree_fingerprint(repo: Path) -> str:
-    hasher = hashlib.sha256()
-    head_proc = run_git(repo, ["rev-parse", "--verify", "HEAD^{commit}"])
-    head_sha = head_proc.stdout.strip() if head_proc.returncode == 0 else "NO_HEAD"
-    hasher.update(f"HEAD:{head_sha}\n".encode("utf-8"))
+    head = run_git(repo, ["rev-parse", "--verify", "HEAD"])
+    tree = run_git(repo, ["write-tree"], check=True).stdout.strip()
+    return f"{head.stdout.strip() or 'unborn'}:{tree}"
 
-    status_proc = run_git(repo, ["status", "--porcelain=v1", "-uall"])
-    if status_proc.returncode != 0:
-        return hasher.hexdigest()
 
-    entries: list[tuple[str, str]] = []
-    for raw in status_proc.stdout.splitlines():
-        if len(raw) < 4:
-            continue
-        status_code = raw[:2]
-        path_part = raw[3:]
-        if " -> " in path_part:
-            path_part = path_part.split(" -> ", 1)[1]
-        rel = path_part.strip().strip('"')
-        entries.append((rel, status_code))
+def tested_candidate(repo: Path) -> str:
+    fingerprint = compute_tree_fingerprint(repo)
+    if (run_git(repo, ["diff", "--quiet", "--ignore-submodules=none"]).returncode
+            or run_git(repo, ["ls-files", "--others", "--exclude-standard", "-z"], check=True).stdout):
+        raise ValueError("Verification needs the staged snapshot. Stage the intended files or use a clean worktree. Put evidence outside the checkout.")
+    return fingerprint
 
-    for rel, status_code in sorted(entries, key=lambda x: x[0]):
-        fpath = repo / rel
-        if fpath.is_symlink():
-            hasher.update(f"LINK:{rel}:{os.readlink(fpath)}\n".encode("utf-8"))
-        elif fpath.is_file():
-            digest = hashlib.sha256(fpath.read_bytes()).hexdigest()
-            hasher.update(f"FILE:{rel}:{digest}\n".encode("utf-8"))
-        else:
-            hasher.update(f"GONE:{rel}:{status_code.strip()}\n".encode("utf-8"))
 
-    return hasher.hexdigest()
+def cmd_begin(args: argparse.Namespace) -> int:
+    repo = find_repo_root(Path(args.repo))
+    sid = args.session_id or os.environ.get("VERIFY_SESSION_ID") or "default"
+    candidate = tested_candidate(repo)
+    session = {} if args.new_task else load_session(repo, sid)
+    session.update(session_id=sid, candidate=candidate, verified=False)
+    session.pop("commit_trailer", None)
+    save_session(repo, sid, session)
+    print(f"Run checks against staged candidate {candidate}")
+    return 0
 
 
 def state_dir(repo: Path) -> Path:
     override = os.environ.get("VERIFY_LOOP_STATE_DIR", "").strip()
     if override:
-        target = Path(override).expanduser().resolve()
+        digest = hashlib.sha256(os.fsencode(repo.resolve())).hexdigest()[:16]
+        target = Path(override).expanduser().resolve() / digest
     else:
-        resolved = repo.resolve()
-        digest = hashlib.sha256(str(resolved).encode("utf-8")).hexdigest()[:16]
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", resolved.name) or "repo"
-        target = Path("/tmp") / "verify-loop-state" / f"{safe_name}-{digest}"
+        git_dir = run_git(repo, ["rev-parse", "--absolute-git-dir"], check=True).stdout.strip()
+        target = Path(git_dir) / "verify-loop-state"
     (target / "sessions").mkdir(parents=True, exist_ok=True)
     return target
 
@@ -436,7 +427,9 @@ def load_session(repo: Path, session_id: str) -> dict[str, Any]:
 
 def save_session(repo: Path, session_id: str, data: dict[str, Any]) -> Path:
     sfile = state_dir(repo) / "sessions" / f"{sanitize_session_id(session_id)}.json"
-    sfile.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    with tempfile.NamedTemporaryFile("w", dir=sfile.parent, encoding="utf-8", delete=False) as out:
+        json.dump(data, out, indent=2, sort_keys=True)
+    os.replace(out.name, sfile)
     return sfile
 
 
@@ -460,7 +453,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
 
     all_items = (
         parse_reliability_checklist(checklist_doc["content"])
-        if checklist_doc["exists"]
+        if checklist_doc.get("trusted")
         else []
     )
     matched_items = match_reliability_items(all_items, changed_files, full_diff)
@@ -482,7 +475,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
         "matched_checks_count": len(matched_items),
         "matched_checks": matched_items,
     }
-    if args.include_review_text and review_doc["exists"]:
+    if args.include_review_text and review_doc.get("trusted"):
         payload["review_md_content"] = review_doc["content"]
 
     if args.json:
@@ -516,7 +509,7 @@ def cmd_triage(args: argparse.Namespace) -> int:
             print(f"    Check:         {item['check']}")
             if item.get("provenance"):
                 print(f"    Provenance:    {item['provenance']}")
-    elif checklist_doc["exists"]:
+    elif checklist_doc.get("trusted"):
         print("\n[OK] 0 reliability checklist triggers matched this diff.")
 
     return 0
@@ -533,28 +526,35 @@ def cmd_record(args: argparse.Namespace) -> int:
         print("Error: --none-reason is required when recording --checks none with --status pass.", file=sys.stderr)
         return 2
 
-    fingerprint = compute_tree_fingerprint(repo)
+    if not checks:
+        raise ValueError("Provide at least one check")
+    fingerprint = tested_candidate(repo) if args.status == "pass" else compute_tree_fingerprint(repo)
+    counts = session.setdefault("failed_fixes", {})
+    session.pop("commit_trailer", None)
+    session["verified"] = False
     if args.status == "fail":
-        round_num = args.round if args.round is not None else int(session.get("failed_rounds", 0)) + 1
-        session["failed_rounds"] = round_num
-        session["verified"] = False
-    elif args.status == "escalated":
-        round_num = args.round if args.round is not None else int(session.get("failed_rounds", 0))
-        session["verified"] = False
-    else:
-        round_num = args.round if args.round is not None else int(session.get("failed_rounds", 0)) + 1
-        session["failed_rounds"] = 0
-        session["verified"] = True
-        session["verified_at"] = now
-        session["tree_fingerprint"] = fingerprint
-        session["checks"] = checks
-        session["none_reason"] = args.none_reason
-        session["commit_trailer"] = format_trailer(checks, args.none_reason)
-
-    must_escalate = args.status == "fail" and int(session.get("failed_rounds", 0)) >= 3
+        for check in set(checks):
+            counts[check] = counts.get(check, 0) + int(args.after_fix)
+    elif args.status == "resolved":
+        for check in checks:
+            counts.pop(check, None)
+    elif args.status == "pass":
+        if fingerprint != session.get("candidate"):
+            raise ValueError("Run begin on the staged candidate and rerun the checks before recording a pass.")
+        for check in checks:
+            counts.pop(check, None)
+        if counts:
+            raise ValueError("Record resolution of outstanding failures: " + ", ".join(sorted(counts)))
+        session.update(verified=True, verified_at=now, tree_fingerprint=fingerprint,
+                       checks=checks, none_reason=args.none_reason,
+                       commit_trailer=format_trailer(checks, args.none_reason))
+    round_num = max((counts.get(check, 0) for check in checks), default=0)
+    session["failed_rounds"] = max(counts.values(), default=0)
+    must_escalate = args.status == "fail" and round_num >= 3
     entry = {
         "timestamp": now,
         "round": round_num,
+        "after_fix": args.after_fix,
         "status": args.status,
         "checks": checks,
         "summary": args.summary or "",
@@ -566,8 +566,6 @@ def cmd_record(args: argparse.Namespace) -> int:
     session["must_escalate"] = must_escalate
 
     sfile = save_session(repo, sid, session)
-    if sid != "default":
-        save_session(repo, "default", {**session, "mirrored_from": sid})
 
     result = {
         "session_file": str(sfile),
@@ -581,6 +579,11 @@ def cmd_record(args: argparse.Namespace) -> int:
         "commit_trailer": session.get("commit_trailer"),
     }
 
+    if must_escalate:
+        failed = {check for check in checks if counts.get(check, 0) >= 3}
+        result["attempts"] = [attempt for attempt in session["round_history"]
+                              if attempt.get("after_fix") and failed.intersection(attempt["checks"])][-3:]
+
     if args.json:
         print(json.dumps(result, indent=2))
     else:
@@ -593,17 +596,17 @@ def cmd_record(args: argparse.Namespace) -> int:
                 "Checks have failed across 3 rounds. Stop attempting automated fixes and escalate "
                 "to a human reviewer with the history of all 3 rounds and concrete failure evidence."
             )
+            for attempt in result["attempts"]:
+                print(f"  {attempt['checks']}: {attempt['summary']} {attempt['evidence']}")
     return 3 if must_escalate else 0
 
 
-def apply_trailer_to_text(message: str, trailer: str) -> str:
-    lines = message.rstrip("\n").splitlines()
-    filtered = [ln for ln in lines if not re.match(r"^Verified-By:\s*", ln, re.IGNORECASE)]
-    if not filtered:
-        return f"{trailer}\n"
-    last_block_has_trailers = bool(re.match(r"^[A-Za-z0-9-]+:\s+.+$", filtered[-1]))
-    sep = "\n" if last_block_has_trailers else "\n\n"
-    return "\n".join(filtered) + f"{sep}{trailer}\n"
+def apply_trailer_to_text(repo: Path, message: str, trailer: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "interpret-trailers", "--if-exists", "replace",
+         "--if-missing", "add", "--trailer", trailer],
+        input=message, text=True, capture_output=True, check=True,
+    ).stdout
 
 
 def cmd_stamp_message(args: argparse.Namespace) -> int:
@@ -614,9 +617,10 @@ def cmd_stamp_message(args: argparse.Namespace) -> int:
     else:
         sid = args.session_id or os.environ.get("VERIFY_SESSION_ID") or "default"
         session = load_session(repo, sid)
-        if not session.get("commit_trailer"):
+        if (not session.get("verified") or not session.get("commit_trailer")
+                or tested_candidate(repo) != session.get("tree_fingerprint")):
             print(
-                f"Error: No recorded verification trailer found for session '{sid}'. "
+                f"Error: No current passing verification found for session '{sid}'. "
                 "Run `verify_guard.py record` first or pass `--checks` explicitly.",
                 file=sys.stderr,
             )
@@ -626,14 +630,14 @@ def cmd_stamp_message(args: argparse.Namespace) -> int:
     if args.file:
         msg_path = Path(args.file)
         original = msg_path.read_text(encoding="utf-8")
-        stamped = apply_trailer_to_text(original, trailer)
+        stamped = apply_trailer_to_text(repo, original, trailer)
         if args.in_place:
             msg_path.write_text(stamped, encoding="utf-8")
         else:
             sys.stdout.write(stamped)
         return 0
 
-    stamped = apply_trailer_to_text(args.message or "", trailer)
+    stamped = apply_trailer_to_text(repo, args.message or "", trailer)
     sys.stdout.write(stamped)
     return 0
 
@@ -656,7 +660,7 @@ def cmd_audit_commits(args: argparse.Namespace) -> int:
     commits: list[dict[str, Any]] = []
     counts = {"verified": 0, "explicit_none": 0, "unstamped": 0}
     for record in proc.stdout.split("\x1e"):
-        record = record.strip()
+        record = record.strip("\n")
         if not record:
             continue
         parts = record.split("\x1f")
@@ -715,12 +719,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_triage.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     p_triage.set_defaults(func=cmd_triage)
 
+    p_begin = sub.add_parser("begin", help="Pin the staged snapshot before running checks")
+    p_begin.add_argument("--repo", default=".")
+    p_begin.add_argument("--session-id")
+    p_begin.add_argument("--new-task", action="store_true", help="Start an independent verification task")
+    p_begin.set_defaults(func=cmd_begin)
+
     p_rec = sub.add_parser("record", help="Record a verification round or passing session stamp")
     p_rec.add_argument("--repo", default=".", help="Path inside git repository")
     p_rec.add_argument("--session-id", default=None, help="Session/conversation identifier")
-    p_rec.add_argument("--status", choices=["pass", "fail", "escalated"], required=True)
+    p_rec.add_argument("--status", choices=["pass", "fail", "escalated", "resolved"], required=True)
     p_rec.add_argument("--checks", required=True, help="Comma-separated checks run (e.g. build,lint,e2e) or 'none'")
-    p_rec.add_argument("--round", type=int, default=None, help="Optional explicit round number")
+    p_rec.add_argument("--after-fix", action="store_true", help="Count this failure as an unsuccessful fix attempt")
     p_rec.add_argument("--summary", default="", help="Brief summary of verification result or failure")
     p_rec.add_argument("--evidence", action="append", default=[], help="Evidence artifact/log path (repeatable)")
     p_rec.add_argument("--none-reason", default=None, help="Required explanation when --checks none --status pass")
@@ -755,4 +765,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        sys.exit(f"Verification error: {exc}")
