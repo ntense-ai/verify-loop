@@ -21,7 +21,7 @@ The examples assume a project installation in `.agents/skills/verify-loop`. For 
 
 Codex, Cursor, Copilot CLI, Gemini CLI, and Antigravity support the project directory above. Claude Code discovers the project skill through `.claude/skills/verify-loop`. This repository supplies a relative directory link there. For checkouts without symlink support, install the full skill directory at the Claude path. In Claude Code, invoke `/verify-loop`.
 
-The optional Git commit-msg hook runs across Git clients. Antigravity also supports an earlier tool-call check. Use a separate reviewer only when available and authorised. Otherwise review the evidence in a fresh pass and record that it was a self-review.
+The optional Git commit-msg hook runs across Git clients. Claude Code and Antigravity also support an earlier tool-call check through a PreToolUse hook. Use a separate reviewer only when available and authorised. Otherwise review the evidence in a fresh pass and record that it was a self-review.
 
 ## Core Operating Invariants
 
@@ -31,6 +31,7 @@ The optional Git commit-msg hook runs across Git clients. Antigravity also suppo
 4. **Three-Strike Escalation Rule**: Iterate to fix failing checks, carrying prior round context forward. If a check still fails after **3 fix rounds**, **STOP immediately** and escalate to a human with a structured summary of all 3 attempts.
 5. **Zero Flake Workarounds**: Never add `sleep`/arbitrary delays, never mark failing tests `.skip`/`xfail`/`#[ignore]`, and never retry until green. Either fix the deterministic root cause or **delete the flaky test and document why**.
 6. **Stamp Every Commit**: Record verification provenance on every commit with a `Verified-By:` trailer (including `Verified-By: none (<reason>)` when verification genuinely cannot apply) so unverified commits remain queryable.
+7. **Close the Loop**: When a miss or a repeated agent failure recurs, turn it into a base-branch rule, a hook, or an `AGENTS.md`/`CLAUDE.md` instruction so it stops recurring. Prune rules that no longer catch anything.
 
 ---
 
@@ -43,7 +44,7 @@ Select the workflow matching your current task:
 | Verify pending changes before finishing, committing, or opening a PR | **Mode 1: Pre-Commit Verification Loop** | Steps below + [`scripts/verify_guard.py`](./scripts/verify_guard.py) |
 | Design or add E2E, property-based, or differential tests, or eliminate flaky tests | **Mode 2: High-Leverage Test Engineering** | [`references/test-strategy.md`](./references/test-strategy.md) + [`scripts/diff_oracle.py`](./scripts/diff_oracle.py) |
 | Run a separate rubric grader or multi-round stateful code review | **Mode 3: Stateful Review & Rubric Grading** | [`references/review-and-grading.md`](./references/review-and-grading.md) |
-| Bootstrap repo verification files, roll out commit gates (`observe` -> `enforce`), turn missed bugs into rules, evaluate check recall, or prune rules | **Mode 4: Bootstrap, Gate & Close the Loop** | [`references/closing-the-loop.md`](./references/closing-the-loop.md) + [`resources/`](./resources/) |
+| Bootstrap repo verification files and a project `verify` skill, roll out commit gates (`observe` -> `enforce`), turn missed bugs and repeated agent failures into rules, evaluate check recall, or prune rules | **Mode 4: Bootstrap, Gate & Close the Loop** | [`references/closing-the-loop.md`](./references/closing-the-loop.md) + [`resources/`](./resources/) |
 
 ---
 
@@ -88,7 +89,7 @@ For each item returned in `matched_checks` from Step 1:
 
 Static checks and isolated unit tests can pass while the user-facing feature is broken. Exercise the running change the way a human or QA engineer would:
 
-- **Locate Repo Smoke Harness / Feature Map**: Check for a repo-local `FEATURE_MAP.md`, smoke script, or app-specific verify runbook near the changed code.
+- **Locate Repo Smoke Harness / Feature Map**: Prefer a project `verify` skill nearest the changed code (for example `.claude/skills/verify-*/SKILL.md` or `.agents/skills/verify-*/SKILL.md`), then `FEATURE_MAP.md` or a smoke script. If the area has none and you had to work out how to boot it, offer to codify those steps with [`resources/verify-skill.template.md`](./resources/verify-skill.template.md).
 - **Drive & Inspect by Surface**:
   - **Web UI**: Boot local dev/preview server; drive real user flows via browser/CDP/Playwright; inspect rendered DOM, console errors, network statuses, and screenshots.
   - **Mobile / Desktop**: Boot simulator/emulator or desktop build; execute the end-to-end flow and inspect visual state and logs.
@@ -159,6 +160,8 @@ All helper scripts require only Python 3 standard library:
   - `stamp-message`: Appends/updates `Verified-By:` trailer on a commit message string or file.
   - `audit-commits`: Queries `git log` to report verified, `Verified-By: none`, and unstamped commits.
 - [`scripts/commit_gate_hook.py`](./scripts/commit_gate_hook.py)
-  - Antigravity `PreToolUse` hook gating `git commit` in `off`, `observe` (default), or `enforce` mode (with 2-block session circuit breaker), plus `--inspect-log` to review observe-mode logs.
+  - `--git-message`: Git `commit-msg` handler that validates the commit Git is actually making (`off`, `observe` default, or `enforce`).
+  - stdin mode: Claude Code or Antigravity `PreToolUse` hook that gives earlier feedback on direct `git commit` calls, with a two-block session circuit breaker in `enforce` mode.
+  - `--inspect-log`: Summarises observe and enforce events so false positives can be reviewed before enforcing.
 - [`scripts/diff_oracle.py`](./scripts/diff_oracle.py)
   - Runs `<old-cmd>` vs `<new-cmd>` across input corpora or generators with output normalizers and an approved-differences allowlist.

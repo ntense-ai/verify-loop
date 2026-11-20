@@ -1,6 +1,25 @@
 # Verify Loop
 
+> [!NOTE]
+> Verify Loop is an implementation of the practices in [How the Claude Code team thinks about verification](https://claude.dev/blog/how-the-claude-code-team-thinks-about-verification/) (Addy Osmani, November 2026). It packages them as a portable agent skill with helper scripts and templates. It is an independent project, not an official Anthropic tool.
+
 Verify Loop helps a coding agent exercise a change, collect evidence, and record which staged Git snapshot passed. It includes a differential test runner and an optional Git commit hook. The helpers require Git and Python 3.9 or later and use the Python standard library.
+
+## How it maps to the article
+
+| Article practice | Where it lives here |
+| --- | --- |
+| Verification means running the change | Mode 1, Step 4 of [SKILL.md](.agents/skills/verify-loop/SKILL.md) drives the real app and captures evidence |
+| A `verify` skill that boots and drives the app | [verify-skill.template.md](.agents/skills/verify-loop/resources/verify-skill.template.md) and [FEATURE_MAP.template.md](.agents/skills/verify-loop/resources/FEATURE_MAP.template.md) |
+| E2E, property, and differential tests | [test-strategy.md](.agents/skills/verify-loop/references/test-strategy.md) and `diff_oracle.py` |
+| Diff-triggered reliability checklist | [RELIABILITY_CHECKLIST.template.md](.agents/skills/verify-loop/resources/RELIABILITY_CHECKLIST.template.md), matched by `verify_guard.py triage` |
+| Escalate to a human after three failed rounds | `verify_guard.py record` exits with code 3 and an escalation summary |
+| One reviewer, multiple rounds, Important / Nit / Pre-existing | [review-and-grading.md](.agents/skills/verify-loop/references/review-and-grading.md) and [REVIEW.template.md](.agents/skills/verify-loop/resources/REVIEW.template.md) |
+| Changes can't modify their own checks | `triage` reads rules from the base branch and flags removed assertions, skips, and sleeps |
+| Results pinned to the exact candidate | Passes are bound to the staged Git tree and parent commit |
+| Stamp every commit, start gates in observe mode | `Verified-By:` trailers, the commit gate (`off` / `observe` / `enforce`), and `audit-commits` |
+| Flaky tests: fix the cause or delete the test | Core invariant 5 and the flake protocol in [test-strategy.md](.agents/skills/verify-loop/references/test-strategy.md) |
+| Close the loop, review the reviewers, prune rules | [closing-the-loop.md](.agents/skills/verify-loop/references/closing-the-loop.md) |
 
 ## Quick start with your coding agent
 
@@ -41,7 +60,7 @@ python3 "$guard" triage
 python3 "$guard" begin --new-task
 ```
 
-Triage reports changed files, integrity findings, and reliability checks from the base branch. Use `triage --base <ref>` to select a particular comparison. The templates under [resources](.agents/skills/verify-loop/resources) provide a starting point for project-specific review rules and user flows.
+Triage reports changed files, integrity findings, and reliability checks from the base branch. Use `triage --base <ref>` to select a particular comparison. The templates under [resources](.agents/skills/verify-loop/resources) provide a starting point for project-specific review rules, user flows, and a project `verify` skill that records how to boot and drive your app.
 
 After `begin`, run the relevant checks and exercise the user-visible change. For an exporter, for example, download a report from the running app and compare its rows with a known fixture. Record the checks that actually passed. Keep evidence in an ignored directory or outside the checkout.
 
@@ -98,7 +117,7 @@ Install from a reviewed checkout. The following example installs a private copy 
 
 Use the installed `verify_guard.py` when verifying changes to the skill itself. To upgrade the gate, install a newly reviewed copy and update `verifyloop.runtime`. To enforce it after observing real commits, run `git config --local verifyloop.gateMode enforce`. Use `off` to disable it. Without a local override, the hook reads the committed mode from a recognised base branch and otherwise defaults to observation. Local Git hooks are operator-controlled. Use independently managed CI when merge policy requires enforcement for every contributor.
 
-Antigravity can also use [the optional PreToolUse template](.agents/skills/verify-loop/resources/hooks.template.json) to provide earlier feedback on direct Git commands. Set its placeholder to the absolute path of the independently installed hook script in a user-controlled hook configuration. The Git hook makes the final decision, including for compound shell commands.
+Claude Code and Antigravity can also run the gate as a PreToolUse hook. This gives earlier feedback on direct `git commit` commands. For Claude Code, merge [claude-settings.template.json](.agents/skills/verify-loop/resources/claude-settings.template.json) into `.claude/settings.local.json` or `~/.claude/settings.json`. For Antigravity, use [hooks.template.json](.agents/skills/verify-loop/resources/hooks.template.json) in a user-controlled hook configuration. Set the placeholder to the absolute path of the independently installed hook script. In enforce mode, the hook lets the third attempt through after two blocks in a session, so the agent does not get stuck. The Git hook makes the final decision, including for compound shell commands.
 
 ## Audit and test
 

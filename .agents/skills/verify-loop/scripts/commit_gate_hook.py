@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Antigravity PreToolUse commit gate hook supporting off, observe, and enforce modes.
+"""Commit gate for Git commit-msg hooks and agent PreToolUse hooks (Claude Code, Antigravity).
+
+Supports off, observe, and enforce modes.
 
 Progressive commit gating behavior:
 - Modes: `off` | `observe` (default) | `enforce`
@@ -130,16 +132,45 @@ def append_gate_log(repo: Path, event: dict[str, Any]) -> None:
         fh.write(json.dumps(event, sort_keys=True) + "\n")
 
 
-def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
-    tool_call = payload.get("toolCall") or {}
-    tool_name = str(tool_call.get("name", "")).strip()
-    args = tool_call.get("args") or {}
-    command_line = str(args.get("CommandLine", ""))
+def detect_host(payload: dict[str, Any]) -> str:
+    """Claude Code sends `tool_name`/`hook_event_name`; Antigravity sends `toolCall`."""
+    return "claude" if "tool_name" in payload or "hook_event_name" in payload else "antigravity"
 
-    if tool_name != "run_command":
-        return {"decision": "allow"}
+
+def shell_call(payload: dict[str, Any]) -> tuple[str, str, str] | None:
+    """Return (command, cwd, conversation id) for a shell tool call, else None."""
+    if detect_host(payload) == "claude":
+        if payload.get("tool_name") != "Bash":
+            return None
+        tool_input = payload.get("tool_input") or {}
+        return (str(tool_input.get("command", "")), str(payload.get("cwd") or "."),
+                str(payload.get("session_id") or "default"))
+    tool_call = payload.get("toolCall") or {}
+    if str(tool_call.get("name", "")).strip() != "run_command":
+        return None
+    args = tool_call.get("args") or {}
     workspace_paths = payload.get("workspacePaths") or []
     cwd = args.get("Cwd") or payload.get("cwd") or (workspace_paths[0] if workspace_paths else ".")
+    return str(args.get("CommandLine", "")), str(cwd), str(payload.get("conversationId") or "default")
+
+
+def render_decision(host: str, decision: dict[str, Any]) -> str:
+    """Format a decision for the calling agent host."""
+    if host != "claude":
+        return json.dumps(decision)
+    if decision["decision"] != "deny":
+        # Print nothing: an explicit Claude Code "allow" would skip the user's permission prompt.
+        return ""
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                              "permissionDecision": "deny",
+                                              "permissionDecisionReason": decision["reason"]}})
+
+
+def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
+    call = shell_call(payload)
+    if call is None:
+        return {"decision": "allow"}
+    command_line, cwd, conversation_id = call
     target = parse_git_commit(command_line, Path(cwd))
     if target is None:
         return {"decision": "allow"}
@@ -150,7 +181,6 @@ def evaluate_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if mode == "off":
         return {"decision": "allow"}
 
-    conversation_id = str(payload.get("conversationId") or "default")
     now = dt.datetime.now(dt.timezone.utc).isoformat()
 
     # The final message (including -F and editor input) is validated by Git.
@@ -289,17 +319,20 @@ def main() -> int:
         return 0
 
     raw = sys.stdin.read()
-    if not raw.strip():
-        print(json.dumps({"decision": "allow"}))
-        return 0
     try:
-        payload = json.loads(raw)
+        payload = json.loads(raw) if raw.strip() else {}
     except json.JSONDecodeError:
-        print(json.dumps({"decision": "allow"}))
-        return 0
-
-    decision = evaluate_pre_tool_use(payload)
-    print(json.dumps(decision))
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    host = detect_host(payload)
+    try:
+        decision = evaluate_pre_tool_use(payload)
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        decision = {"decision": "deny", "reason": f"verify-loop gate error: {exc}"}
+    output = render_decision(host, decision)
+    if output:
+        print(output)
     return 0
 
 
@@ -307,7 +340,4 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
-        if len(sys.argv) == 1:
-            print(json.dumps({"decision": "deny", "reason": str(exc)}))
-        else:
-            sys.exit(f"verify-loop: {exc}")
+        sys.exit(f"verify-loop: {exc}")

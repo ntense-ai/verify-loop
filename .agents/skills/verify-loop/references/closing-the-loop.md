@@ -14,15 +14,20 @@ Copy and tailor the starter templates from [`../resources/`](../resources/) as c
    - Diff-triggered checks (`Trigger Paths`, `Trigger Diff Regex`, `Check`, `Provenance`) evaluated automatically by `verify_guard.py triage`.
 3. **`FEATURE_MAP.md`** (from [`../resources/FEATURE_MAP.template.md`](../resources/FEATURE_MAP.template.md))
    - User-visible flows, selectors/shortcuts/commands, and expected outcomes for E2E smoke testing and rubric grading.
-4. **Optional Git commit gate**
+4. **Project `verify` skills** (from [`../resources/verify-skill.template.md`](../resources/verify-skill.template.md))
+   - One skill per surface that codifies how to boot, drive, inspect, and tear down the running app. Place it as close to the code it covers as the agent's skill discovery allows. Step 4 of the pre-commit loop runs it.
+   - Treat it as the smoke-test harness: time it, run it several times from a cold start after each edit, and fix flakes at the root.
+5. **Code-owner checks**
+   - The owner of an area writes its `REVIEW.md` rules and checklist items, then refines them until they flag what the owner would flag. Each rule states the invariant it protects, so an escalation can explain why without the reviewer reconstructing it from the diff.
+6. **Optional Git commit gate**
    - Install the commit-msg template in the repository's active Git hooks. Set the repository-local Git setting `verifyloop.runtime` to the absolute path of a separately installed copy of the reviewed scripts. Integrate the check into any existing commit-msg hook.
-   - Antigravity also supports the PreToolUse template. Set its command to the absolute trusted script path in the host's user-controlled hook settings.
+   - Claude Code and Antigravity also support an earlier PreToolUse check. For Claude Code, merge [`../resources/claude-settings.template.json`](../resources/claude-settings.template.json) into `.claude/settings.local.json` or `~/.claude/settings.json`. For Antigravity, use [`../resources/hooks.template.json`](../resources/hooks.template.json) in its user-controlled hook settings. In both cases set the command to the absolute trusted script path. Do not commit the hook to a settings file that the changes it judges can edit.
 
 ## 2. Progressive commit gate rollout
 
 Start with `git config --local verifyloop.gateMode observe`. Inspect events with `commit_gate_hook.py --inspect-log` and compare them with `verify_guard.py audit-commits`. To enable enforcement, set the local mode to `enforce`. A named base branch's committed configuration supplies the default when the local setting is absent. A bootstrap checkout defaults to observation.
 
-Git validates the final staged tree and the message's verification trailer. A documented `Verified-By: none (reason)` trailer records an explicit exception. The Antigravity preflight retains its two-block session circuit breaker. The Git hook evaluates the actual commit independently.
+Git validates the final staged tree and the message's verification trailer. A documented `Verified-By: none (reason)` trailer records an explicit exception, so an agent is never stuck: it can always commit by stating why the change is unverified, and the audit still shows it. The PreToolUse preflight retains its two-block session circuit breaker. The Git hook evaluates the actual commit independently.
 
 ## 3. Turning Missed Bugs into Rules (Two Formal Workflows)
 
@@ -51,7 +56,20 @@ When analyzing a past production incident tied to a specific PR:
 
 ---
 
-## 4. Evaluating the Verification System ("Reviewing the Reviewers")
+## 4. Feeding Agent Failures Back into Agent Behaviour
+
+Rules in `REVIEW.md` catch bugs in the code. Some failures come from the agent's habits instead, such as repeatedly failing the same check or forgetting the same step. When the same check fails for the same reason in two or more tasks, change the agent's environment so the mistake stops recurring:
+
+1. **Prefer a hook when the trigger is mechanical.** For example, a check that scans logs for user data can run as a PreToolUse or PostToolUse hook, so the agent gets the failure while it is still working.
+2. **Otherwise add one concrete instruction** to the agent's project instructions (`AGENTS.md`, `CLAUDE.md`, or `GEMINI.md`) next to the code it concerns. Name the check, the failure, and what to do instead. Cite the task or PR that prompted it.
+3. **Make the final check run automatically.** In Claude Code, a `Stop` hook can run the fast test suite when the agent finishes and return failures to it, or a `/goal` can require a passing suite. Guard a `Stop` hook against loops by honouring the `stop_hook_active` input field.
+4. **Confirm it worked.** Check that the failure stops appearing in later tasks' `record --status fail` entries. Remove the instruction or hook if it did not help.
+
+Instructions and feedback hooks in this section guide the agent rather than decide whether a change passes, so they may live in the working tree. Anything that gates a change, including the commit gate, stays out of reach of that change.
+
+---
+
+## 5. Evaluating the Verification System ("Reviewing the Reviewers")
 
 Measure check quality against real engineering outcomes rather than gut feel:
 
@@ -73,11 +91,12 @@ Measure check quality against real engineering outcomes rather than gut feel:
 
 ---
 
-## 5. Routine Hygiene & Pruning
+## 6. Routine Hygiene & Pruning
 
 Test suites, smoke harnesses, `REVIEW.md`, and `RELIABILITY_CHECKLIST.md` grow monotonically if left unattended, slowing runs and diluting model attention.
 
 Run a periodic pruning pass:
 - **Delete or merge** checklist/review rules whose gated APIs, schemas, or subsystems no longer exist, or that have zero true-positive hits and high false-positive friction.
+- **Prune agent instructions and hooks** from section 4 once the habit they corrected no longer appears.
 - **Profile test runtime**: optimize or split slow tests out of Tier 1; consolidate redundant E2E flows covered by faster property/integration invariants.
 - **Purge flaky tests** whose root cause remains unresolved, leaving a concise commit note explaining why the test was removed.

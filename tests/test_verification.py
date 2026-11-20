@@ -135,6 +135,21 @@ class VerificationTests(unittest.TestCase):
             decision = json.loads(self.script("commit_gate_hook.py", data=json.dumps(payload)))
             self.assertEqual(decision["decision"], "deny")
 
+    def test_claude_code_pre_tool_use(self):
+        self.git("config", "verifyloop.gateMode", "enforce")
+        def decide(command, tool="Bash"):
+            payload = {"hook_event_name": "PreToolUse", "tool_name": tool, "session_id": "cc",
+                       "cwd": str(self.repo), "tool_input": {"command": command}}
+            out = self.script("commit_gate_hook.py", data=json.dumps(payload)).strip()
+            return json.loads(out)["hookSpecificOutput"]["permissionDecision"] if out else ""
+        self.stage("candidate\n")
+        self.assertEqual(decide("git status"), "")
+        self.assertEqual(decide("git commit", tool="Read"), "")
+        self.assertEqual(decide("git commit -m wip"), "deny")
+        self.assertEqual(decide("git commit -m 'Docs\n\nVerified-By: none (notes only)'"), "")
+        self.passed()
+        self.assertEqual(decide("git commit -m wip"), "")
+
     def test_deleted_assertion_and_unborn_staged_test(self):
         self.repo = self.root / "new"
         self.repo.mkdir()
