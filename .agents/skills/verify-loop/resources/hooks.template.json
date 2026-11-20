@@ -1,0 +1,17 @@
+{
+  "verify-loop-commit-gate": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./skills/verify-loop/scripts/commit_gate_hook.py",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
